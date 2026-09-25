@@ -49,6 +49,10 @@ test("search ranks relevant products above unrelated promoted cards", () => {
   ];
   assert.deepEqual(rankSearchResults("milk", products).map((p) => p.product_id), [2, 3]);
   assert.deepEqual(rankSearchResults("nonexistent", products), products);
+  assert.equal(rankSearchResults("Goodnight Flash", [
+    { product_id: 4, name: "Chilli chips" },
+    { product_id: 5, name: "Good Knight Flash Refill" },
+  ])[0].product_id, 5);
 });
 
 test("payment requires explicit enablement and a bounded recent checkout", async () => {

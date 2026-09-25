@@ -90,7 +90,7 @@ Payment initiation is **off by default**. To enable it, set `BLINKIT_ENABLE_PAYM
 
 The location must be set before search, catalog, or cart calls. Search without location can return HTTP 400. The search parser ranks matching products above unrelated promoted cards.
 
-Verification on 2026-09-26: build and automated tests passed, the MCP stdio server listed tools and rejected payment by default, and a live **logged-out** Lucknow `blinkit_search("milk")` returned 13 relevant products. OTP login, authenticated checkout, and payment still need a test with the owner's account before they can be called verified.
+Verification on 2026-09-26: build and automated tests passed, the MCP stdio server listed tools and rejected payment by default, and live **logged-out** Lucknow searches returned milk, Similac Isomil (with price, image, and stock), and Good Knight Flash for both `Goodnight Flash` and `Goodknight Flash`. OTP login, authenticated checkout, and payment still need a test with the owner's account before they can be called verified.
 
 ## Notes / limits
 
