@@ -1,6 +1,4 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readState, writeState } from "./state.js";
 import { computeCart, type CartView } from "./api.js";
 import type { CartItem } from "./parse.js";
 
@@ -9,20 +7,12 @@ import type { CartItem } from "./parse.js";
  * (you post the full item list each time), so we keep the line items locally and
  * reprice on every change.
  */
-const DIR = join(homedir(), ".blinkit-mcp");
-const FILE = join(DIR, "cart.json");
-
 async function load(): Promise<CartItem[]> {
-  try {
-    return JSON.parse(await readFile(FILE, "utf8"));
-  } catch {
-    return [];
-  }
+  return (await readState<CartItem[]>("cart.json")) ?? [];
 }
 
 async function save(items: CartItem[]): Promise<void> {
-  await mkdir(DIR, { recursive: true, mode: 0o700 });
-  await writeFile(FILE, JSON.stringify(items, null, 2), { mode: 0o600 });
+  await writeState("cart.json", items);
 }
 
 function normalize(raw: any, quantity?: number): CartItem {
@@ -49,20 +39,25 @@ export async function addItems(rawItems: any[]): Promise<CartView & { lines: Car
   const cart = await load();
   for (const raw of rawItems) {
     const item = normalize(raw, raw.quantity);
+    if (!Number.isSafeInteger(item.product_id) || item.product_id <= 0 ||
+        !Number.isSafeInteger(item.merchant_id) || item.merchant_id <= 0 ||
+        !Number.isSafeInteger(item.quantity) || item.quantity <= 0) {
+      throw new Error("Cart item requires valid product, merchant, and quantity");
+    }
     const existing = cart.find((c) => c.product_id === item.product_id);
     if (existing) existing.quantity += item.quantity;
     else cart.push(item);
   }
-  await save(cart);
   const view = await computeCart(cart);
+  await save(cart);
   return { ...view, lines: cart };
 }
 
 export async function removeItem(productId: number): Promise<CartView & { lines: CartItem[] }> {
   let cart = await load();
   cart = cart.filter((c) => c.product_id !== productId);
-  await save(cart);
   const view = await computeCart(cart);
+  await save(cart);
   return { ...view, lines: cart };
 }
 

@@ -19,8 +19,8 @@ see [`RESEARCH.md`](./RESEARCH.md).
 ## Setup
 
 ```bash
-pnpm install
-pnpm build
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm test
 ```
 
 Add to your MCP client (e.g. Claude Code `mcp` config):
@@ -28,15 +28,23 @@ Add to your MCP client (e.g. Claude Code `mcp` config):
 ```json
 {
   "mcpServers": {
-    "blinkit": { "command": "node", "args": ["/path/to/blinkit-mcp/dist/index.js"] }
+    "blinkit": {
+      "command": "node",
+      "args": ["/absolute/path/to/blinkit-mcp/dist/index.js"],
+      "env": { "BLINKIT_MAX_ORDER_RUPEES": "2000" }
+    }
   }
 }
 ```
 
-State is stored in `~/.blinkit-mcp/`:
+State is stored in `~/.blinkit-mcp/` (or the absolute `BLINKIT_STATE_DIR`). The directory is mode 700 and JSON files are mode 600:
 - `session.json` — device id, auth_key, **access_token** (secret), location, store. chmod 600.
 - `staples.json` — your reorder catalog + scorer weights.
 - `cart.json` — the current working cart.
+- `checkout.json` — the last validated checkout, valid for 10 minutes.
+- `prepared-order.json` and `payment.json` — short-lived payment state. Treat these as secrets.
+
+The MCP server uses stdio. It has no public HTTP listener. Any MCP client that can call its tools can read shopping results and, after login, act on the account. Connect it only to clients you trust.
 
 ## Tools
 
@@ -48,16 +56,16 @@ State is stored in `~/.blinkit-mcp/`:
 **Checkout/pay** — `blinkit_get_addresses`, `blinkit_checkout`, `blinkit_prepare_order`, `blinkit_pay_upi`, `blinkit_payment_status`
 **Orders** — `blinkit_order_count`, `blinkit_order_history`
 
-### Typical flow (fully headless; only PhonePe approval is manual)
+### Typical flow (set your own location and enable payment first)
 
 ```
-blinkit_set_location { lat: 28.5653836, lon: 77.38265 }      # once, persists
+blinkit_set_location { lat: 26.8467, lon: 80.9462 }            # example: Lucknow; use your delivery location
 blinkit_send_otp     { phone: "9XXXXXXXXX" }
 blinkit_verify_otp   { phone: "9XXXXXXXXX", code: "1234" }    # stores access_token + phone
 blinkit_pick_best    { query: "milk", brands:["Amul"], attrs:["full cream"] }  # → product
 blinkit_get_addresses                                        # → address_id
 blinkit_checkout     { items: [ <chosen> ], address_id }     # → server cart_id (creates+binds+validates)
-blinkit_pay_upi      { cart_id, method:"collect", vpa:"name@ybl", wait:true }
+blinkit_pay_upi      { cart_id, confirm_payable: 250, method:"collect", vpa:"name@ybl", wait:true }
 #   → pushes a UPI collect to PhonePe; streams status via notifications; you approve on your phone
 ```
 
@@ -71,8 +79,18 @@ blinkit_pay_upi      { cart_id, method:"collect", vpa:"name@ybl", wait:true }
 - The server declares the MCP **`logging`** capability and emits `notifications/message` during the
   wait ("waiting for approval", "✅ approved", "❌ failed") — surfaced live by Claude Code.
 
-> Payment is delegated to Zomato **zpaykit**; the human step is approving the UPI request in PhonePe.
+> Payment is delegated to Zomato **zpaykit**; the human step is approving the UPI request in the UPI app.
 > See `RESEARCH.md §8–9` for the full captured flow.
+
+### Payment safety
+
+Payment initiation is **off by default**. To enable it, set `BLINKIT_ENABLE_PAYMENT=true` in the MCP process environment after verifying your account and delivery address. `BLINKIT_MAX_ORDER_RUPEES` defaults to 2000; set a lower value if desired. Checkout must be validated in the last 10 minutes, and the amount passed as `confirm_payable` must exactly match both the validated cart and the prepared payment order. The server never returns PAS tokens or payment hashes to the MCP client. If a payment call times out, the attempt is recorded before the network call and cannot be repeated for that cart; check payment status and start a fresh checkout if needed.
+
+`blinkit_prepare_order` reuses a recently prepared order instead of creating another payment session for the same cart. It is also disabled until payment is enabled.
+
+The location must be set before search, catalog, or cart calls. Search without location can return HTTP 400. The search parser ranks matching products above unrelated promoted cards.
+
+Verification on 2026-09-26: build and automated tests passed, the MCP stdio server listed tools and rejected payment by default, and a live **logged-out** Lucknow `blinkit_search("milk")` returned 13 relevant products. OTP login, authenticated checkout, and payment still need a test with the owner's account before they can be called verified.
 
 ## Notes / limits
 

@@ -1,6 +1,9 @@
-import { request, ensureAuthKey, BlinkitError } from "./client.js";
+import { request, ensureAuthKey, requireLocation, BlinkitError } from "./client.js";
 import { loadSession, updateSession } from "./session.js";
 import { extractProducts, extractOrders, type Product, type CartItem } from "./parse.js";
+import { assertPayable, saveCheckout } from "./safety.js";
+import { deleteState } from "./state.js";
+import { rankSearchResults } from "./search.js";
 
 /* ----------------------------- Auth / login ----------------------------- */
 
@@ -37,6 +40,7 @@ export async function verifyOtp(phone: string, code: string): Promise<VerifyResu
 
 export async function logout() {
   await updateSession({ access_token: undefined, user_id: undefined });
+  await Promise.all(["checkout.json", "prepared-order.json", "payment.json"].map(deleteState));
 }
 
 /* ----------------------------- Location ----------------------------- */
@@ -88,12 +92,14 @@ export async function setLocation(lat: number, lon: number) {
 /* ----------------------------- Catalog ----------------------------- */
 
 export async function getHomeFeed(): Promise<Product[]> {
+  requireLocation(await loadSession());
   await ensureAuthKey();
   const res = await request<any>("/feed/", { query: { template_version: 9 } });
   return extractProducts(res);
 }
 
 export async function searchProducts(query: string, page = 0): Promise<Product[]> {
+  requireLocation(await loadSession());
   await ensureAuthKey();
   const q: Record<string, any> = { q: query, search_type: "type_to_search" };
   if (page > 0) {
@@ -108,10 +114,11 @@ export async function searchProducts(query: string, page = 0): Promise<Product[]
     query: q,
     json: { applied_filters: null, sort: "", previous_search_query: query },
   });
-  return extractProducts(res);
+  return rankSearchResults(query, extractProducts(res));
 }
 
 export async function autosuggest(query: string): Promise<string[]> {
+  requireLocation(await loadSession());
   await ensureAuthKey();
   const res = await request<any>("/v1/actions/auto_suggest", {
     method: "POST",
@@ -129,6 +136,7 @@ export async function autosuggest(query: string): Promise<string[]> {
 }
 
 export async function getRecommendations(productId: number): Promise<Product[]> {
+  requireLocation(await loadSession());
   await ensureAuthKey();
   const res = await request<any>(
     `/v1/actions/product_recommendations/${productId}`,
@@ -158,6 +166,7 @@ export interface CartView {
  * client side — you POST the full item list each time and get back the priced cart.
  */
 export async function computeCart(items: CartItem[]): Promise<CartView> {
+  requireLocation(await loadSession());
   await ensureAuthKey();
   const res = await request<any>("/v5/carts", {
     method: "POST",
@@ -222,6 +231,15 @@ export async function prepareCheckout(
   items: CartItem[],
   addressId: number,
 ): Promise<{ cart_id: number; payable: number; valid: boolean }> {
+  await deleteState("checkout.json");
+  const session = await loadSession();
+  if (!session.access_token) throw new Error("Login is required before checkout");
+  if (!Number.isSafeInteger(addressId) || addressId <= 0) throw new Error("Invalid address id");
+  if (!items.length || items.some((item) => !Number.isSafeInteger(item.product_id) || item.product_id <= 0 ||
+    !Number.isSafeInteger(item.merchant_id) || item.merchant_id <= 0 ||
+    !Number.isSafeInteger(item.quantity) || item.quantity <= 0)) {
+    throw new Error("Checkout requires valid product, merchant, and quantity values");
+  }
   await ensureAuthKey();
   const created = await request<any>("/v5/carts", {
     method: "POST",
@@ -232,10 +250,15 @@ export async function prepareCheckout(
   if (!cartId) throw new BlinkitError("Failed to create server cart", 0, created);
   await request(`/v5/carts/${cartId}`, { method: "PATCH", authed: true, json: { address_id: addressId } });
   const validated = await request<any>(`/v5/carts/${cartId}/validate`, { method: "POST", authed: true, json: {} });
+  const payable = validated?.cart_data?.bill_details?.payable_amount ?? created?.cart_data?.bill_details?.payable_amount;
+  const valid = validated?.cart_data?.status_code === 0;
+  if (!valid) throw new Error("Blinkit did not validate the cart");
+  assertPayable(payable);
+  await saveCheckout({ cartId: String(cartId), addressId, payable, createdAt: Date.now() });
   return {
     cart_id: cartId,
-    payable: validated?.cart_data?.bill_details?.payable_amount ?? created?.cart_data?.bill_details?.payable_amount,
-    valid: (validated?.cart_data?.status_code ?? 0) === 0,
+    payable,
+    valid,
   };
 }
 

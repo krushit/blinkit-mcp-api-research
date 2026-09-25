@@ -59,8 +59,12 @@ interface RequestOpts {
   authed?: boolean;
 }
 
-function buildUrl(path: string, query?: RequestOpts["query"]): string {
-  const url = new URL(path.startsWith("http") ? path : BASE + path);
+export function buildUrl(path: string, query?: RequestOpts["query"]): string {
+  if (!path.startsWith("/") || path.startsWith("//")) {
+    throw new Error("Blinkit request path must be relative to blinkit.com");
+  }
+  const url = new URL(path, BASE);
+  if (url.origin !== BASE) throw new Error("Unexpected Blinkit request origin");
   if (query) {
     for (const [k, v] of Object.entries(query)) {
       if (v !== undefined) url.searchParams.set(k, String(v));
@@ -120,6 +124,8 @@ export async function request<T = any>(path: string, opts: RequestOpts = {}): Pr
     method: opts.method ?? (body ? "POST" : "GET"),
     headers,
     body,
+    redirect: "manual",
+    signal: AbortSignal.timeout(15000),
   });
 
   const text = await res.text();
@@ -130,7 +136,7 @@ export async function request<T = any>(path: string, opts: RequestOpts = {}): Pr
     /* leave as text */
   }
 
-  if (res.status >= 400) {
+  if (res.status >= 300) {
     throw new BlinkitError(`Blinkit ${res.status} on ${path}`, res.status, parsed);
   }
   return parsed as T;
