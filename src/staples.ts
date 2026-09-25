@@ -1,13 +1,10 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readState, writeState } from "./state.js";
 import { searchProducts } from "./api.js";
 import type { Product } from "./parse.js";
 
 /**
- * The user's reorder catalog and pick preferences. Tuned to the profile:
- * single Noida location, full-auto reorders for known staples, "balance brand &
- * price" (prefer brand, swap to cheaper equivalent only if savings are large).
+ * The user's reorder catalog and pick preferences. Nothing is auto-added until
+ * the user explicitly saves staples with auto: true.
  */
 export interface Staple {
   /** Canonical key, e.g. "milk", "bread". */
@@ -42,33 +39,22 @@ export interface ScorerWeights {
   price: number;
 }
 
-const DIR = join(homedir(), ".blinkit-mcp");
-const FILE = join(DIR, "staples.json");
-
 const DEFAULT_PREFS: Prefs = {
   // "balance brand & price": brand/attr matter most, then availability, then price.
   scorer: { brand: 5, attr: 4, eta: 3, price: 2 },
   swap_savings_threshold: 0.15,
-  staples: [
-    { key: "milk", query: "milk", attrs: ["full cream"], unit: "500 ml", quantity: 1, auto: true },
-    { key: "bread", query: "brown bread", quantity: 1, auto: true },
-    { key: "eggs", query: "eggs", quantity: 1, auto: true },
-  ],
+  staples: [],
 };
 
 export async function loadPrefs(): Promise<Prefs> {
-  try {
-    const raw = await readFile(FILE, "utf8");
-    return { ...DEFAULT_PREFS, ...JSON.parse(raw) } as Prefs;
-  } catch {
-    await savePrefs(DEFAULT_PREFS);
-    return DEFAULT_PREFS;
-  }
+  const saved = await readState<Prefs>("staples.json");
+  if (saved) return { ...DEFAULT_PREFS, ...saved };
+  await savePrefs(DEFAULT_PREFS);
+  return DEFAULT_PREFS;
 }
 
 export async function savePrefs(p: Prefs): Promise<void> {
-  await mkdir(DIR, { recursive: true, mode: 0o700 });
-  await writeFile(FILE, JSON.stringify(p, null, 2), { mode: 0o600 });
+  await writeState("staples.json", p);
 }
 
 const has = (hay: string | undefined, needle: string) =>
@@ -90,10 +76,10 @@ export function pickBest(
     const strict = pool.filter((p) =>
       opts.attrs!.every((a) => has(p.name, a) || has(p.unit, a) || has(p.brand, a)),
     );
-    if (strict.length) pool = strict;
+    pool = strict;
   }
   if (opts.maxPrice !== undefined) pool = pool.filter((p) => (p.price ?? Infinity) <= opts.maxPrice!);
-  if (!pool.length) pool = candidates;
+  if (!pool.length) return { alternatives: [], reason: "No available product meets the filters" };
 
   const prices = pool.map((p) => p.price ?? Infinity).filter((n) => Number.isFinite(n));
   const minP = Math.min(...prices, Infinity);

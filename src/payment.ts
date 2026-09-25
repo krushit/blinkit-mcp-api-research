@@ -1,9 +1,8 @@
 import { Impit } from "impit";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { request } from "./client.js";
 import { loadSession } from "./session.js";
+import { deleteState, readState, writeState } from "./state.js";
+import { assertPayable, assertPaymentEnabled, requireCheckout } from "./safety.js";
 
 /**
  * HEADLESS payment via Blinkit → Zomato zpaykit. Captured from a live checkout.
@@ -43,8 +42,19 @@ export interface PreparedOrder {
   paymentHash: string;
 }
 
+interface StoredPreparedOrder extends PreparedOrder {
+  createdAt: number;
+}
+
 /** Steps 1–2: mint a payment session for a (server-synced) cart. Throws if a payment is already pending. */
 export async function prepareOrder(cartId: string): Promise<PreparedOrder> {
+  if (!/^\d+$/.test(cartId)) throw new Error("Invalid cart id");
+  const checkout = await requireCheckout(String(cartId));
+  const existing = await readState<StoredPreparedOrder>("prepared-order.json");
+  if (existing?.cartId === String(cartId) && Date.now() - existing.createdAt < 10 * 60_000) {
+    if (existing.payable !== checkout.payable) throw new Error("Payment total differs from validated checkout");
+    return existing;
+  }
   const co = await request<any>(`/createOrder/${cartId}`, { authed: true });
   const pasToken = co?.response?.access_token;
   const orderHash = co?.orderHash;
@@ -60,7 +70,7 @@ export async function prepareOrder(cartId: string): Promise<PreparedOrder> {
     json: { cart_id: String(cartId), payment_info_data: { payment_method_id: 50, payment_method_type: "upi_qr" } },
   });
   const meta = ph?.zomato_payment_hash_meta;
-  return {
+  const prepared: PreparedOrder = {
     cartId: String(cartId),
     pasToken,
     orderHash,
@@ -68,6 +78,12 @@ export async function prepareOrder(cartId: string): Promise<PreparedOrder> {
     payable: meta?.payable_amount,
     paymentHash: meta?.payment_hash,
   };
+  assertPayable(prepared.payable);
+  if (prepared.payable !== checkout.payable || !prepared.paymentHash || !prepared.orderId) {
+    throw new Error("Payment total or session differs from the validated checkout. Start a new checkout.");
+  }
+  await writeState("prepared-order.json", { ...prepared, createdAt: Date.now() });
+  return prepared;
 }
 
 function commonForm(o: PreparedOrder, phone: string): Record<string, string> {
@@ -110,7 +126,10 @@ async function zpost(client: Impit, path: string, pasToken: string, form: Record
       origin: "https://www.zomato.com",
     },
     body: new URLSearchParams(form).toString(),
+    redirect: "manual",
+    signal: AbortSignal.timeout(15000),
   });
+  if (res.status >= 300) throw new Error(`Zomato payment request failed with HTTP ${res.status}`);
   const text = await res.text();
   try {
     return JSON.parse(text);
@@ -137,6 +156,13 @@ export async function initUpiPayment(
   phone: string,
   opts: { method: "qr" | "collect"; vpa?: string } = { method: "qr" },
 ): Promise<{ result: UpiPaymentResult; client: Impit }> {
+  assertPaymentEnabled();
+  const checkout = await requireCheckout(o.cartId);
+  assertPayable(o.payable);
+  if (checkout.payable !== o.payable) throw new Error("Payment total differs from validated checkout");
+  if (opts.method === "collect" && (!opts.vpa || !/^[^\s@]+@[^\s@]+$/.test(opts.vpa))) {
+    throw new Error("A valid VPA is required for UPI collect");
+  }
   const client = zomatoClient();
   // 3) establish zpaykit session
   await zpost(client, "getPaymentMethods", o.pasToken, { ...commonForm(o, phone), online_payments_flag: "1", isMobileView: "false" });
@@ -148,6 +174,12 @@ export async function initUpiPayment(
     opts.method === "collect"
       ? { ...commonForm(o, phone), payment_method_type: "upi_collect", vpa: opts.vpa ?? "", payments_config_params: "[object Object]" }
       : { ...commonForm(o, phone), payment_method_id: "50", payment_method_type: "upi_qr", payments_config_params: "[object Object]" };
+  const previous = await loadPaymentContext();
+  if (previous?.cartId === o.cartId) {
+    throw new Error("Payment was already initiated for this cart. Check its status before starting a new checkout.");
+  }
+  // Spend this attempt before the network call; an ambiguous timeout must not replay payment.
+  await savePaymentContext({ ...o, phone });
   const mp = await zpost(client, "makePayment", o.pasToken, form);
   const t = mp?.response?.transaction;
   await savePaymentContext({ ...o, phone, trackId: t?.track_id });
@@ -158,7 +190,7 @@ export async function initUpiPayment(
       status: t?.status ?? mp?.response?.status,
       upiIntent: t?.qr_data?.data,
       gatewayType: t?.gateway_type,
-      raw: mp?.response ? undefined : mp,
+      raw: undefined,
     },
   };
 }
@@ -181,7 +213,11 @@ export async function pollPaymentStatus(
     const r = await zpost(client, "verifyPaymentStatus", o.pasToken, { ...commonForm(o, phone) });
     const status = String(r?.response?.status ?? r?.status ?? "unknown");
     await onUpdate?.(status, i + 1);
-    if (status && !/pending|processing|unknown/i.test(status)) return status;
+    if (status && !/pending|processing|unknown/i.test(status)) {
+      await deleteState("payment.json");
+      await deleteState("prepared-order.json");
+      return status;
+    }
     await new Promise((res) => setTimeout(res, intervalMs));
   }
   return "timeout";
@@ -194,20 +230,13 @@ export interface PaymentContext extends PreparedOrder {
   trackId?: string;
 }
 
-const CTX_FILE = join(homedir(), ".blinkit-mcp", "payment.json");
-
 /** Persist the in-flight payment so status can be re-checked across tool calls / restarts. */
 export async function savePaymentContext(ctx: PaymentContext): Promise<void> {
-  await mkdir(join(homedir(), ".blinkit-mcp"), { recursive: true, mode: 0o700 });
-  await writeFile(CTX_FILE, JSON.stringify(ctx, null, 2), { mode: 0o600 });
+  await writeState("payment.json", ctx);
 }
 
 export async function loadPaymentContext(): Promise<PaymentContext | null> {
-  try {
-    return JSON.parse(await readFile(CTX_FILE, "utf8"));
-  } catch {
-    return null;
-  }
+  return readState<PaymentContext>("payment.json");
 }
 
 /**
@@ -222,7 +251,12 @@ export async function checkPaymentStatus(cartId?: string): Promise<{ cart_id?: s
   const client = zomatoClient();
   await zpost(client, "getPaymentMethods", ctx.pasToken, { ...commonForm(ctx, ctx.phone), online_payments_flag: "1", isMobileView: "false" });
   const r = await zpost(client, "verifyPaymentStatus", ctx.pasToken, { ...commonForm(ctx, ctx.phone) });
-  return { cart_id: ctx.cartId, order_id: ctx.orderId, status: String(r?.response?.status ?? r?.status ?? "unknown") };
+  const status = String(r?.response?.status ?? r?.status ?? "unknown");
+  if (!/pending|processing|unknown/i.test(status)) {
+    await deleteState("payment.json");
+    await deleteState("prepared-order.json");
+  }
+  return { cart_id: ctx.cartId, order_id: ctx.orderId, status };
 }
 
 export async function userPhone(): Promise<string> {

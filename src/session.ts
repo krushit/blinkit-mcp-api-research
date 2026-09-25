@@ -1,7 +1,5 @@
 import { randomUUID, randomBytes } from "node:crypto";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readState, writeState } from "./state.js";
 
 /**
  * Persistent session/device state for the Blinkit MCP.
@@ -35,9 +33,6 @@ export interface Session {
   location_label?: string;
 }
 
-const DIR = join(homedir(), ".blinkit-mcp");
-const FILE = join(DIR, "session.json");
-
 let cache: Session | null = null;
 
 function freshSession(): Session {
@@ -49,20 +44,15 @@ function freshSession(): Session {
 
 export async function loadSession(): Promise<Session> {
   if (cache) return cache;
-  try {
-    const raw = await readFile(FILE, "utf8");
-    cache = { ...freshSession(), ...JSON.parse(raw) } as Session;
-  } catch {
-    cache = freshSession();
-    await saveSession(cache);
-  }
+  const saved = await readState<Session>("session.json");
+  cache = saved ? { ...freshSession(), ...saved } : freshSession();
+  if (!saved) await saveSession(cache);
   return cache;
 }
 
 export async function saveSession(s: Session): Promise<void> {
+  await writeState("session.json", s);
   cache = s;
-  await mkdir(DIR, { recursive: true, mode: 0o700 });
-  await writeFile(FILE, JSON.stringify(s, null, 2), { mode: 0o600 });
 }
 
 /** Merge a partial update into the session and persist. */
@@ -72,5 +62,3 @@ export async function updateSession(patch: Partial<Session>): Promise<Session> {
   await saveSession(next);
   return next;
 }
-
-export const SESSION_DIR = DIR;

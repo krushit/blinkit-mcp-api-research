@@ -21,8 +21,9 @@ import {
   prepareCheckout,
 } from "./api.js";
 import { addItems, removeItem, clearCart, viewCart } from "./cart.js";
-import { prepareOrder, initUpiPayment, pollPaymentStatus, checkPaymentStatus, userPhone } from "./payment.js";
+import { prepareOrder, initUpiPayment, pollPaymentStatus, checkPaymentStatus, loadPaymentContext, userPhone } from "./payment.js";
 import { loadPrefs, savePrefs, pickBest, resolveStaple, type Staple } from "./staples.js";
+import { assertPaymentEnabled, requireCheckout } from "./safety.js";
 
 const server = new McpServer(
   { name: "blinkit-mcp", version: "0.1.0" },
@@ -61,7 +62,7 @@ function tool<S extends z.ZodRawShape>(
     } catch (err) {
       const msg =
         err instanceof BlinkitError
-          ? `${err.message}${err.body ? ` :: ${JSON.stringify(err.body)}` : ""}`
+          ? err.message
           : err instanceof Error
             ? err.message
             : String(err);
@@ -144,7 +145,7 @@ tool(
     query: z.string(),
     brands: z.array(z.string()).optional().describe("preferred brands, best first"),
     attrs: z.array(z.string()).optional().describe("required attribute keywords, e.g. ['full cream']"),
-    max_price: z.number().optional(),
+    max_price: z.number().positive().optional(),
   },
   async ({ query, brands, attrs, max_price }) => {
     const prefs = await loadPrefs();
@@ -272,9 +273,13 @@ tool(
 
 tool(
   "blinkit_prepare_order",
-  "Mint a payment session for a server-synced cart (createOrder + zomato_payment_hash). Returns PAS token, orderId, payable amount. Fails if the order already has a pending payment.",
+  "Mint a payment session for a recently validated checkout. Returns order ID and payable amount, never payment credentials.",
   { cart_id: z.string().describe("the server cart id (from the web cart / checkout)") },
-  ({ cart_id }) => prepareOrder(cart_id),
+  async ({ cart_id }) => {
+    assertPaymentEnabled();
+    const order = await prepareOrder(cart_id);
+    return { cart_id: order.cartId, order_id: order.orderId, payable: order.payable };
+  },
 );
 
 tool(
@@ -284,17 +289,28 @@ tool(
     cart_id: z.string(),
     method: z.enum(["qr", "collect"]).default("qr"),
     vpa: z.string().optional().describe("payer UPI id for collect, e.g. name@ybl"),
+    confirm_payable: z.number().positive().describe("exact payable rupees shown by checkout or prepare_order"),
     wait: z.boolean().default(false).describe("if true, poll verifyPaymentStatus until terminal"),
   },
-  async ({ cart_id, method, vpa, wait }) => {
+  async ({ cart_id, method, vpa, confirm_payable, wait }) => {
+    assertPaymentEnabled();
+    const checkout = await requireCheckout(cart_id);
+    if (checkout.payable !== confirm_payable) throw new Error("Confirmed amount differs from validated checkout");
+    if (method === "collect" && (!vpa || !/^[^\s@]+@[^\s@]+$/.test(vpa))) {
+      throw new Error("A valid VPA is required for UPI collect");
+    }
+    if ((await loadPaymentContext())?.cartId === cart_id) {
+      throw new Error("Payment was already initiated for this cart. Check its status before starting a new checkout.");
+    }
     const phone = await userPhone();
     if (!phone) throw new Error("No phone on file; set BLINKIT_PHONE or log in again.");
     const order = await prepareOrder(cart_id);
+    if (order.payable !== confirm_payable) throw new Error("Confirmed amount differs from payment order");
     const { result, client } = await initUpiPayment(order, phone, { method, vpa });
     await notify(
       "info",
       method === "collect"
-        ? `UPI collect for ₹${order.payable} sent to ${vpa} — approve it in PhonePe.`
+        ? `UPI collect for ₹${order.payable} sent — approve it in your UPI app.`
         : `UPI request ready for ₹${order.payable} — open the intent link / scan to approve in PhonePe.`,
     );
     if (wait && result.trackId) {
